@@ -1,0 +1,437 @@
+#include "code_gen.h"
+#include "name.h"
+#include "lex.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <error.h>
+#include <string.h>
+#include <ctype.h>
+
+extern char *newname( void       );
+extern void freename( char *name );
+
+FILE *assFile, *interFile, *lexemeFile;
+char REG[8] = {'A','B','C','D','E','F','G','H'};
+
+
+void statements()
+{
+	/*
+		statements -> statements statement | statement
+	*/
+
+	assFile = fopen("Assembly.asm", "w");
+	interFile = fopen("Intermediate.txt", "w");
+
+	fprintf(assFile, "%s\n", "ORG 0000h");
+
+	while(!match(EOI))
+		statement();
+
+	fprintf(assFile, "%s\n", "END");
+	fclose(assFile);
+	fclose(interFile);
+}
+
+void statement()
+{
+	/*
+		statement ->	ID:=expression1;
+					  | IF expression1 then statement
+					  | while expression1 do statement
+					  | expression1;
+					  |	begin  stmt_list end
+	*/
+
+	char *tempvar;
+
+	if(match(ID))
+	{
+		char assignment[100];
+		int loop_var=0;
+		for(;loop_var<yyleng;loop_var++)assignment[loop_var]=*(yytext+loop_var);
+		assignment[loop_var]='\0';
+
+		advance();
+		if( !legal_lookahead( COL, 0 ) ){
+			fprintf( stderr, "%d: Inserting missing colon\n", yylineno );
+			goto legal_lookahead_SEMI;
+		}else{
+			advance();
+			if( !legal_lookahead( EQUAL, 0 ) ){
+				fprintf( stderr, "%d: Inserting missing equal\n", yylineno );
+				goto legal_lookahead_SEMI;
+			}else{
+				advance();
+				tempvar = expression1();
+				fprintf(interFile,"%s <- %s\n",assignment,tempvar);
+
+				if(strcmp(tempvar, "t0") == 0){
+					fprintf(assFile, "STA _%s\n", assignment);
+				} else {
+					fprintf(assFile, "PUSH A\nMOV A %c\nSTA _%s\nPOP A\n", REG[tempvar[1]-'0'], assignment);
+				}
+			}
+		}
+	}
+	else if(match(IF)){
+		advance();
+		fprintf(interFile, "if (\n");
+		tempvar = expression1();
+		if( !legal_lookahead( THEN, 0 ) )
+		{
+			freename(tempvar);
+			fprintf( stderr, "%d: Inserting missing then\n", yylineno );
+			goto legal_lookahead_SEMI;
+		}else{
+			fprintf(interFile, "%s)\n", tempvar);
+			int ifthenLabel = getIfThenLabel();
+			fprintf(assFile, "CMP %c 0\nJZ IFTHEN%d\n", REG[tempvar[1] -'0'], ifthenLabel);
+			fprintf(interFile, "%s\n", "then {");
+			advance();
+			freename(tempvar);
+			statement();
+			fprintf(interFile, "%s\n", "}");
+			fprintf(assFile, "IFTHEN%d:\n", ifthenLabel);
+			return;
+		}
+	}
+	else if(match(WHILE))
+	{
+		advance();
+		int loopLabel1 = getLoopLabel();
+		fprintf(assFile, "LOOP%d:\n",loopLabel1);
+		fprintf(interFile, "while (\n");
+		tempvar = expression1();
+		if( !legal_lookahead( DO, 0 ) )
+		{
+			freename(tempvar);
+			fprintf( stderr, "%d: Inserting missing do\n", yylineno );
+			goto legal_lookahead_SEMI;
+		}else{
+			fprintf(interFile, "%s)\n", tempvar);
+			int loopLabel = getLoopLabel();
+			fprintf(assFile, "CMP %c 0\nJZ LOOP%d\n", REG[tempvar[1]-'0'], loopLabel);
+
+			fprintf(interFile, "%s\n", "do {");
+			advance();
+
+			freename(tempvar);
+			statement();
+			fprintf(interFile, "%s\n", "}");
+			fprintf(assFile, "JMP LOOP%d\nLOOP%d:\n", loopLabel1, loopLabel);
+			return;
+		}
+	}
+	else if(match(BEGIN))
+	{
+		fprintf(interFile, "%s\n", "BEGIN{");
+		advance();
+		stmt_list();
+		if(!legal_lookahead(END,0))
+		{
+			fprintf( stderr, "%d: Inserting missing END\n", yylineno );
+			goto legal_lookahead_SEMI;
+		} else {
+			fprintf(interFile, "} %s\n", "END");
+			lexemeFile = fopen("Lexemes.txt", "a+");
+			fprintf(lexemeFile, "<END> ");
+			fclose(lexemeFile);
+			advance();
+		}
+		return;
+	}
+	else{
+		tempvar = expression1();
+	}
+
+	if(tempvar!=NULL){
+		freename( tempvar );
+	} else{
+		exit(1);
+	}
+
+legal_lookahead_SEMI:
+		if( match( SEMI ) ){
+			advance();
+		}else{
+			fprintf( stderr, "%d: Inserting missing semicolon\n", yylineno );
+		}
+}
+
+void stmt_list()
+{
+
+	/*
+		stmt_list -> statement stmt_list | epsilon
+	*/
+
+	while(!match(END)&&!match(EOI))
+		statement();
+	if(match(EOI)){
+		fprintf( stderr, "%d: End of file reached no END found\n", yylineno );
+	}
+}
+
+char *expression1()
+{
+	/*
+		expression1 ->	  expression
+						| expression<expression
+						| expression=expression
+						| expression>expression
+	*/
+
+	char *tempvar3;
+	char * tempvar=expression();
+	if(match(GT))
+	{
+		freename(tempvar);
+		tempvar3=newname();
+		tempvar=newname();
+		fprintf(interFile, "%s <- %s\n", tempvar, tempvar3);
+		fprintf(assFile, "MOV %c %c\n", REG[tempvar[1]-'0'], REG[tempvar3[1]-'0']);
+
+		advance();
+		char *tempvar2=expression();
+
+		fprintf(interFile, "%s <-  %s > %s\n",tempvar3,tempvar,tempvar2);
+		int compLabel = getCompareLabel();
+		fprintf(assFile, "CMP %c %c\n",REG[tempvar[1]-'0'],REG[tempvar2[1]-'0']);
+		fprintf(assFile, "MVI %c 1\nJNZ COMPARE%d\nMVI %c 0\nCOMPARE%d:\n", REG[tempvar3[1]-'0'], compLabel, REG[tempvar3[1]-'0'], compLabel);
+
+		freename(tempvar2);
+		freename(tempvar);
+		return tempvar3;
+	}
+	else if(match(LT))
+	{
+		freename(tempvar);
+		tempvar3=newname();
+		tempvar=newname();
+		fprintf(interFile, "%s <- %s\n", tempvar, tempvar3);
+		fprintf(assFile, "MOV %c %c\n", REG[tempvar[1]-'0'], REG[tempvar3[1]-'0']);
+
+		advance();
+		char *tempvar2=expression();
+		fprintf(interFile, "%s <-  %s < %s\n",tempvar3,tempvar,tempvar2);
+		int compLabel = getCompareLabel();
+		fprintf(assFile, "CMP %c %c\n",REG[tempvar[1]-'0'],REG[tempvar2[1]-'0']);
+		fprintf(assFile, "MVI %c 1\nJC COMPARE%d\nMVI %c 0\nCOMPARE%d:\n", REG[tempvar3[1]-'0'], compLabel, REG[tempvar3[1]-'0'], compLabel);
+
+		freename(tempvar);
+		freename(tempvar2);
+		return tempvar3;
+	}
+	else if(match(EQUAL))
+	{
+		freename(tempvar);
+		tempvar3=newname();
+		tempvar=newname();
+		fprintf(interFile, "%s <- %s\n", tempvar, tempvar3);
+		fprintf(assFile, "MOV %c %c\n", REG[tempvar[1]-'0'], REG[tempvar3[1]-'0']);
+
+		advance();
+		char *tempvar2=expression();
+		fprintf(interFile, "%s <-  %s == %s\n",tempvar3,tempvar,tempvar2);
+		int compLabel = getCompareLabel();
+		fprintf(assFile, "CMP %c %c\n",REG[tempvar[1]-'0'],REG[tempvar2[1]-'0']);
+		fprintf(assFile, "MVI %c 1\nJZ COMPARE%d\nMVI %c 0\nCOMPARE%d:\n", REG[tempvar3[1]-'0'], compLabel, REG[tempvar3[1]-'0'], compLabel);
+
+		freename(tempvar);
+		freename(tempvar2);
+		return tempvar3;
+	}
+	return tempvar;
+}
+
+char *expression()
+{
+	/*
+		expression  -> term expression'
+		expression' ->    PLUS term expression'
+						| MINUS term expression'
+						| epsilon
+	*/
+
+	char  *tempvar, *tempvar2;
+
+	tempvar = term();
+	while( match( PLUS ) || match(MINUS) )
+	{
+		int PlusFlag=(match(PLUS))?1:0;
+		advance();
+		tempvar2 = term();
+		if(PlusFlag){
+			fprintf(interFile, "%s += %s\n",tempvar,tempvar2);
+			if(strcmp(tempvar, "t0") == 0){
+				fprintf(assFile, "ADD %c\n",REG[tempvar2[1]-'0']);
+			} else {
+				fprintf(assFile, "PUSH A\nMOV A %c\nADD %c\nMOV %c, A\nPOP A\n",REG[tempvar[1]-'0'], REG[tempvar2[1]-'0'],REG[tempvar[1]-'0']);				// Assembly Code
+			}
+		}
+		else{
+			fprintf(interFile, "%s -= %s\n",tempvar,tempvar2);
+			if(strcmp(tempvar, "t0") == 0){
+				fprintf(assFile, "SUB %c\n",REG[tempvar2[1]-'0']);
+			} else {
+				fprintf(assFile, "PUSH A\nMOV A %c\nSUB %c\nMOV %c, A\nPOP A\n",REG[tempvar[1]-'0'], REG[tempvar2[1]-'0'],REG[tempvar[1]-'0']);
+			}
+		}
+		freename( tempvar2 );
+	}
+
+	return tempvar;
+}
+
+char *term()
+{
+	/*
+		term 	->  factor term'
+		term' 	->  TIMES factor term'
+					| DIV factor term'
+					| epsilon
+	*/
+
+	char  *tempvar, *tempvar2 ;
+
+	tempvar = factor();
+	while( match( TIMES ) || match(DIV))
+	{
+		int TimesFlag=(match(TIMES))?1:0;
+		advance();
+		tempvar2 = factor();
+		if(TimesFlag){
+			fprintf(interFile, "%s *= %s\n",tempvar,tempvar2);
+			if(strcmp(tempvar, "t0") == 0){
+				fprintf(assFile, "MUL %c\n",REG[tempvar2[1]-'0']);
+			} else {
+				fprintf(assFile, "PUSH A\nMOV A %c\nMUL %c\nMOV %c, A\nPOP A\n",REG[tempvar[1]-'0'], REG[tempvar2[1]-'0'],REG[tempvar[1]-'0']);
+			}
+		}
+		else {
+			fprintf(interFile, "%s /= %s\n",tempvar,tempvar2);
+			if(strcmp(tempvar, "t0") == 0){
+				fprintf(assFile, "DIV %c\n",REG[tempvar2[1]-'0']);
+			} else {
+				fprintf(assFile, "PUSH A\nMOV A %c\nDIV %c\nMOV %c, A\nPOP A\n",REG[tempvar[1]-'0'], REG[tempvar2[1]-'0'],REG[tempvar[1]-'0']);
+			}
+		}
+		freename( tempvar2 );
+	}
+
+	return tempvar;
+}
+
+char *factor()
+{
+	/*
+		factor ->   NUM_OR_ID
+				  | LP expression RP
+	*/
+	char *tempvar=NULL;
+
+	if( match(NUM_OR_ID) )
+	{
+	/* Print the assignment instruction. The %0.*s conversion is a form of
+	 * %X.Ys, where X is the field width and Y is the maximum number of
+	 * characters that will be printed (even if the string is longer). I'm
+	 * using the %0.*s to print the string because it's not \0 terminated.
+	 * The field has a default width of 0, but it will grow the size needed
+	 * to print the string. The ".*" tells printf() to take the maximum-
+	 * number-of-characters count from the next argument (yyleng).
+	 */
+
+		fprintf(interFile, "%s = %.*s\n", tempvar = newname(), yyleng, yytext );
+		int condition_check_digit=1;
+		int loop_var=0;
+		for(;loop_var<yyleng;loop_var++)
+		{
+			if(!isdigit(*(yytext+loop_var)))
+			{
+				condition_check_digit=0;
+				break;
+			}
+		}
+		if(condition_check_digit){
+			fprintf(assFile, "MVI %c %.*s\n",REG[tempvar[1]-'0'], yyleng,  yytext);
+		} else {
+			if(strcmp(tempvar, "t0") == 0){
+				fprintf(assFile, "LDA _%.*s\n",yyleng,  yytext);
+			} else {
+				fprintf(assFile, "PUSH A\nLDA _%.*s\nMOV %c A\nPOP A\n",yyleng,  yytext,REG[tempvar[1]-'0']);
+			}
+		}
+
+		advance();
+	}
+	else if( match(LP) )
+	{
+		advance();
+		tempvar = expression();
+		if( match(RP) )
+			advance();
+		else
+			fprintf(stderr, "%d: Mismatched parenthesis\n", yylineno );
+	}
+	else
+	fprintf( stderr, "%d: Number or identifier expected\n", yylineno );
+
+	return tempvar;
+}
+
+#include <stdarg.h>
+#define MAXFIRST 16
+#define SYNCH    SEMI
+
+int legal_lookahead( int first_arg , ...)
+{
+	/* Simple error detection and recovery. Arguments are a 0-terminated list of
+	 * those tokens that can legitimately come next in the input. If the list is
+	 * empty, the end of file must come next. Print an error message if
+	 * necessary. Error recovery is performed by discarding all input symbols
+	 * until one that's in the input list is found
+	 *
+	 * Return true if there's no error or if we recovered from the error,
+	 * false if we can't recover.
+	 */
+
+	va_list     args;
+	int     tok;
+	int     lookaheads[MAXFIRST], *p = lookaheads, *current;
+	int     error_printed = 0;
+	int     rval          = 0;
+
+	va_start( args, first_arg );
+
+	if( !first_arg )
+	{
+		if( match(EOI) )
+			rval = 1;
+	}
+	else
+	{
+		*p++ = first_arg;
+		while( (tok = va_arg(args, int)) && p < &lookaheads[MAXFIRST] )
+			*p++ = tok;
+
+		while( !match( SYNCH ) ) {
+			for( current = lookaheads; current < p ; ++current )
+			if( match( *current ) )
+			{
+				rval = 1;
+				goto exit;
+			}
+
+			if( !error_printed ){
+				fprintf( stderr, "Line %d: Syntax error\n", yylineno );
+				error_printed = 1;
+			}
+			advance();
+	   }
+	}
+
+exit:
+	va_end( args );
+	return rval;
+}
